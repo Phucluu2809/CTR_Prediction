@@ -1,0 +1,35 @@
+Hướng dẫn chạy nhanh dự án
+
+1. Tạo và kích hoạt môi trường ảo
+   Windows PowerShell:
+   python -m venv .venv
+   .\.venv\Scripts\Activate.ps1
+
+2. Cài đặt các thư viện phụ thuộc
+   pip install -r requirements.txt
+
+3. Tiền xử lý dữ liệu
+   python src/preprocess.py
+
+4. Kiểm tra kết quả tiền xử lý
+   python src/check_processed_data.py
+
+5. Huấn luyện mô hình cơ sở LR
+   python src/train_lr.py
+
+6. Kiểm thử Dataset
+   python src/test_dataset.py
+
+7. Kiểm thử cấu trúc mô hình DeepFM
+   python src/test_model.py
+
+8. Huấn luyện DeepFM
+   python src/train_deepfm.py
+
+9. Tạo bảng so sánh kết quả
+   python src/make_comparison.py
+
+Các tệp kết quả chính:
+- outputs/results/lr_metrics.json
+- outputs/results/deepfm_metrics.json
+- outputs/results/comparison.csv
