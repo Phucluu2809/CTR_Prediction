@@ -14,6 +14,8 @@ ROOT_DIR = Path(__file__).resolve().parent
 METRICS_PATH = ROOT_DIR / "outputs" / "results" / "deepfm_metrics.json"
 CATALOG = build_catalog()
 PAGE_SIZE = 12
+SESSION_MAX_UPLIFT = 0.50
+CATALOG_PRIOR_STRENGTH = 1.50
 
 st.set_page_config(page_title="CTR Shop — DeepFM", page_icon="🛍️", layout="wide")
 st.markdown("""
@@ -58,6 +60,14 @@ def stable_seed(values):
     return int(hashlib.sha256(raw.encode("utf-8")).hexdigest()[:12], 16)
 
 
+def minmax(values):
+    values = values.astype(float)
+    value_range = values.max() - values.min()
+    if value_range == 0:
+        return pd.Series(0.5, index=values.index)
+    return (values - values.min()) / value_range
+
+
 def sigmoid(value):
     return 1 / (1 + np.exp(-np.clip(value, -20, 20)))
 
@@ -68,27 +78,69 @@ def score_catalog(context, click_history):
     indices = [(seed + item["id"] * 397) % len(pool) for item in CATALOG]
     outputs = predictor().predict(pool.iloc[indices].reset_index(drop=True))
     frame = pd.DataFrame(CATALOG)
-    frame["base_ctr"] = outputs["ctr"]
-    frame["linear"] = outputs["linear"]
-    frame["fm"] = outputs["fm"]
-    frame["deep"] = outputs["deep"]
-    frame["logit"] = outputs["logit"]
+
+    # Criteo rows are anonymous and cannot be mapped one-to-one to catalog products.
+    # DeepFM therefore provides a context-level prior, while actual catalog metadata
+    # differentiates products during cold start.
+    deepfm_prior = float(np.mean(outputs["ctr"]))
+    deepfm_prior = float(np.clip(deepfm_prior, 1e-6, 1 - 1e-6))
+    frame["deepfm_prior"] = deepfm_prior
+
+    rating_score = frame["rating"].clip(0, 5) / 5
+    popularity_score = minmax(frame["popularity"])
+    discount_score = minmax(frame["discount"])
+    frame["catalog_prior"] = (
+        0.55 * rating_score
+        + 0.30 * popularity_score
+        + 0.15 * discount_score
+    )
+
+    prior_logit = np.log(deepfm_prior / (1 - deepfm_prior))
+    centered_catalog_prior = frame["catalog_prior"] - frame["catalog_prior"].mean()
+    frame["base_ctr"] = sigmoid(
+        prior_logit + CATALOG_PRIOR_STRENGTH * centered_catalog_prior
+    )
+    frame["session_score"] = 0.0
 
     if not click_history:
         frame["ctr"] = frame["base_ctr"]
         return frame.sort_values(["ctr", "popularity"], ascending=False).reset_index(drop=True)
 
-    clicked_items = [item for product_id in click_history for item in CATALOG if item["id"] == product_id]
+    catalog_by_id = {item["id"]: item for item in CATALOG}
+    clicked_items = [catalog_by_id[product_id] for product_id in click_history if product_id in catalog_by_id]
+    if not clicked_items:
+        frame["ctr"] = frame["base_ctr"]
+        return frame.sort_values(["ctr", "popularity"], ascending=False).reset_index(drop=True)
+
     clicked = pd.DataFrame(clicked_items)
     category_counts = clicked["category"].value_counts().to_dict()
     brand_counts = clicked["brand"].value_counts().to_dict()
-    total = len(click_history)
-    median_price = float(clicked["price"].median())
-    category_affinity = frame["category"].map(category_counts).fillna(0) / total
-    brand_affinity = frame["brand"].map(brand_counts).fillna(0) / total
-    price_affinity = np.exp(-abs(frame["price"] - median_price) / max(median_price, 1))
-    interaction_boost = 1.15 * category_affinity + 0.75 * brand_affinity + 0.20 * price_affinity
-    frame["ctr"] = sigmoid(frame["logit"] + interaction_boost)
+
+    # Count-based interests never become weaker merely because another item is clicked.
+    # The exponential saturation keeps repeated clicks from dominating the base model.
+    category_interest = 1 - np.exp(-frame["category"].map(category_counts).fillna(0))
+    brand_interest = 1 - np.exp(-frame["brand"].map(brand_counts).fillna(0))
+
+    # Use the best match against any clicked price instead of a moving median. Adding a
+    # click can therefore improve, but never reduce, an item's price similarity.
+    clicked_prices = clicked["price"].drop_duplicates().to_numpy(dtype=float)
+    product_prices = frame["price"].to_numpy(dtype=float)[:, None]
+    price_similarity = np.exp(
+        -np.abs(product_prices - clicked_prices[None, :])
+        / np.maximum(clicked_prices[None, :], 1)
+    ).max(axis=1)
+
+    # Session behavior is a separate, bounded signal. Category interest gates the
+    # brand/price signals so a Laptop click does not boost unrelated categories.
+    frame["session_score"] = category_interest * (
+        0.70 + 0.20 * brand_interest + 0.10 * price_similarity
+    )
+
+    # Preserve the DeepFM probability and add only a bounded uplift for ranking.
+    # This stays in [base_ctr, 1] and is monotonic as matching clicks accumulate.
+    frame["ctr"] = frame["base_ctr"] + (
+        1 - frame["base_ctr"]
+    ) * SESSION_MAX_UPLIFT * frame["session_score"]
     return frame.sort_values(["ctr", "popularity"], ascending=False).reset_index(drop=True)
 
 
@@ -129,21 +181,25 @@ context = [age, gender, region, device, period, day, browser]
 ranking = score_catalog(context, st.session_state.click_history)
 metric = metrics()
 
-st.markdown("""<div class="hero"><h1>Khám phá sản phẩm dành cho bạn</h1><p>100 sản phẩm được sắp xếp theo xác suất click dự đoán.</p></div>""", unsafe_allow_html=True)
+st.markdown("""<div class="hero"><h1>Khám phá sản phẩm dành cho bạn</h1><p>100 sản phẩm được xếp hạng bằng DeepFM kết hợp hành vi trong phiên.</p></div>""", unsafe_allow_html=True)
 metric_cols = st.columns(4)
 metric_cols[0].metric("Sản phẩm", "100")
-metric_cols[1].metric("Model", "DeepFM")
-metric_cols[2].metric("Test AUC", f"{metric['test_auc']:.4f}")
+metric_cols[1].metric("Xếp hạng", "Hybrid DeepFM")
+metric_cols[2].metric("DeepFM Test AUC", f"{metric['test_auc']:.4f}")
 metric_cols[3].metric("Lượt tương tác", len(st.session_state.click_history))
 
 if st.session_state.click_history:
-    st.markdown("<div class='notice active'>Đang cá nhân hóa danh sách theo lịch sử click trong phiên.</div>", unsafe_allow_html=True)
+    st.markdown("<div class='notice active'>Điểm hybrid đang kết hợp CTR DeepFM với mức nâng có giới hạn cho các danh mục đã click.</div>", unsafe_allow_html=True)
 else:
-    st.markdown("<div class='notice'>Chưa có lịch sử tương tác — đang sử dụng xếp hạng CTR ban đầu.</div>", unsafe_allow_html=True)
+    st.markdown("<div class='notice'>Cold-start: CTR nền DeepFM được kết hợp với đánh giá, độ phổ biến và ưu đãi của catalog. Hãy bấm Xem sản phẩm để bắt đầu cá nhân hóa.</div>", unsafe_allow_html=True)
 
 filters = st.columns([2, 1, 1])
 search = filters[0].text_input("Tìm sản phẩm", placeholder="Nhập tên hoặc thương hiệu...")
-category = filters[1].selectbox("Danh mục", ["Tất cả"] + sorted(ranking["category"].unique().tolist()))
+category = filters[1].selectbox(
+    "Danh mục",
+    ["Tất cả"] + sorted(ranking["category"].unique().tolist()),
+    help="Đây chỉ là bộ lọc hiển thị; nút Xem sản phẩm mới ghi nhận sở thích.",
+)
 sort_mode = filters[2].selectbox("Sắp xếp", ["CTR cao nhất", "Giá thấp nhất", "Giá cao nhất"])
 
 visible = ranking.copy()
@@ -174,27 +230,52 @@ for row_start in range(0, len(page_frame), 4):
                 <div class="pname">{item['name']}</div>
                 <div class="price">{money(item['price'])}</div>
                 <div class="meta">★ {item['rating']:.1f}/5 · Còn {item['stock']} sản phẩm</div>
-                <span class="badge">CTR {item['ctr']:.1%}</span>
+                <span class="badge">Điểm CTR {item['ctr']:.1%}</span>
             </div>
             """, unsafe_allow_html=True)
             if st.button("Xem sản phẩm", key=f"product_{int(item['id'])}", width="stretch"):
                 register_click(int(item["id"]))
 
 st.divider()
-chart_left, chart_right = st.columns([1.35, 1])
-with chart_left:
-    st.subheader("Top 10 sản phẩm theo CTR")
-    st.bar_chart(ranking.head(10).set_index("name")[["ctr"]], horizontal=True, color="#4f46e5", height=390)
-with chart_right:
-    st.subheader("Chi tiết dự đoán")
-    top_product_ids = ranking.head(20)["id"].astype(int).tolist()
-    product_names = ranking.set_index("id")["name"].to_dict()
-    selected_id = st.selectbox("Sản phẩm", top_product_ids, format_func=lambda value: product_names[value])
-    selected = ranking[ranking["id"] == selected_id].iloc[0]
-    detail_cols = st.columns(2)
-    detail_cols[0].metric("CTR hiện tại", f"{selected['ctr']:.2%}")
-    detail_cols[1].metric("CTR ban đầu", f"{selected['base_ctr']:.2%}")
-    components = pd.DataFrame({"Giá trị": [selected["linear"], selected["fm"], selected["deep"]]}, index=["Linear", "FM", "Deep"])
-    st.bar_chart(components, color="#10b981", height=245)
+if visible.empty:
+    st.info("Không có sản phẩm phù hợp với bộ lọc hiện tại.")
+else:
+    # Charts and details must use the same filtered product set as the cards above.
+    chart_ranking = visible.sort_values(
+        ["ctr", "popularity"], ascending=False
+    ).reset_index(drop=True)
+    chart_left, chart_right = st.columns([1.35, 1])
+    with chart_left:
+        st.subheader("Top sản phẩm trong danh sách đang lọc")
+        st.bar_chart(
+            chart_ranking.head(10).set_index("name")[["ctr"]],
+            horizontal=True,
+            color="#4f46e5",
+            height=390,
+        )
+    with chart_right:
+        st.subheader("Chi tiết xếp hạng")
+        top_product_ids = chart_ranking.head(20)["id"].astype(int).tolist()
+        product_names = chart_ranking.set_index("id")["name"].to_dict()
+        selected_id = st.selectbox(
+            "Sản phẩm",
+            top_product_ids,
+            format_func=lambda value: product_names[value],
+        )
+        selected = chart_ranking[chart_ranking["id"] == selected_id].iloc[0]
+        detail_cols = st.columns(2)
+        detail_cols[0].metric("Điểm CTR hybrid", f"{selected['ctr']:.2%}")
+        detail_cols[1].metric("CTR cold-start", f"{selected['base_ctr']:.2%}")
+        signals = pd.DataFrame(
+            {
+                "Giá trị": [
+                    selected["deepfm_prior"],
+                    selected["catalog_prior"],
+                    selected["session_score"],
+                ]
+            },
+            index=["DeepFM prior", "Catalog prior", "Session interest"],
+        )
+        st.bar_chart(signals, color="#10b981", height=245)
 
 st.caption("Lịch sử tương tác chỉ được tạo sau khi khách hàng bấm xem sản phẩm và được giữ trong phiên hiện tại.")
